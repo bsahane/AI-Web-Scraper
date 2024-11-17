@@ -32,9 +32,13 @@ def main():
             if content:
                 st.success("Website scraped successfully!")
                 
+                # Show DOM content in expander
+                with st.expander("📋 Page Structure & Content", expanded=True):
+                    st.markdown(content["dom_content"])
+                
                 # Show raw content in expander
-                with st.expander("View Raw Content"):
-                    st.text(content)
+                with st.expander("📝 Raw Content"):
+                    st.text(content["raw_content"])
                 
                 # Analysis options
                 analysis_type = st.radio(
@@ -45,7 +49,7 @@ def main():
                 if analysis_type == "General Analysis":
                     if st.button("Analyze Content"):
                         with st.spinner("Analyzing content..."):
-                            analysis = analyze_content(content, llm_config)
+                            analysis = analyze_content(content["raw_content"], llm_config)
                             st.write(analysis)
                 
                 else:
@@ -55,7 +59,7 @@ def main():
                     )
                     if specific_info and st.button("Extract Information"):
                         with st.spinner("Extracting information..."):
-                            extracted_info = extract_specific_info(content, specific_info, llm_config)
+                            extracted_info = extract_specific_info(content["raw_content"], specific_info, llm_config)
                             st.write(extracted_info)
         
         except Exception as e:

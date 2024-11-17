@@ -46,22 +46,103 @@ def create_chrome_driver():
         logger.error("Full traceback:", exc_info=True)
         raise
 
-def scrape_website(url: str) -> str:
+def get_readable_dom(soup):
+    """Convert DOM to a human-readable format"""
+    readable_content = []
+    
+    # Get title
+    if soup.title:
+        readable_content.append(f"📄 Page Title: {soup.title.string.strip()}\n")
+    
+    # Get meta description
+    meta_desc = soup.find('meta', attrs={'name': 'description'})
+    if meta_desc and meta_desc.get('content'):
+        readable_content.append(f"📝 Description: {meta_desc['content']}\n")
+    
+    # Get main headings
+    headings = []
+    for tag in ['h1', 'h2', 'h3']:
+        for heading in soup.find_all(tag):
+            text = heading.get_text().strip()
+            if text:
+                level = int(tag[1])
+                indent = "  " * (level - 1)
+                headings.append(f"{indent}{'#' * level} {text}")
+    if headings:
+        readable_content.append("📚 Page Structure:\n" + "\n".join(headings) + "\n")
+    
+    # Get main content sections
+    main_content = []
+    content_tags = ['article', 'main', 'section', 'div']
+    
+    for tag in content_tags:
+        for element in soup.find_all(tag, class_=lambda x: x and any(keyword in str(x).lower() for keyword in ['content', 'main', 'article', 'body'])):
+            section_title = element.find(['h1', 'h2', 'h3', 'h4'])
+            if section_title:
+                section_title = section_title.get_text().strip()
+            else:
+                section_title = "Content Section"
+            
+            paragraphs = element.find_all('p')
+            if paragraphs:
+                content = "\n".join(p.get_text().strip() for p in paragraphs[:3] if p.get_text().strip())
+                if content:
+                    main_content.append(f"📌 {section_title}:\n{content}\n")
+    
+    if main_content:
+        readable_content.append("📄 Main Content Sections:\n" + "\n".join(main_content))
+    
+    # Get navigation links
+    nav_links = []
+    nav_elements = soup.find_all(['nav', 'menu']) + soup.find_all(class_=lambda x: x and 'nav' in str(x).lower())
+    for nav in nav_elements:
+        links = nav.find_all('a')
+        for link in links:
+            text = link.get_text().strip()
+            href = link.get('href', '')
+            if text and href and not href.startswith('#'):
+                nav_links.append(f"  • {text} ({href})")
+    
+    if nav_links:
+        readable_content.append("🔗 Navigation Links:\n" + "\n".join(nav_links[:10]) + "\n")
+    
+    # Get forms
+    forms = []
+    for form in soup.find_all('form'):
+        form_info = []
+        form_info.append("  📝 Form Fields:")
+        for input_field in form.find_all(['input', 'textarea', 'select']):
+            field_type = input_field.get('type', input_field.name)
+            field_name = input_field.get('name', input_field.get('id', field_type))
+            if field_type not in ['hidden', 'submit']:
+                form_info.append(f"    • {field_name} ({field_type})")
+        if len(form_info) > 1:
+            forms.extend(form_info)
+    
+    if forms:
+        readable_content.append("📋 Forms:\n" + "\n".join(forms) + "\n")
+    
+    return "\n".join(readable_content)
+
+def scrape_website(url: str) -> dict:
     """Scrape content from a website"""
     try:
-        logger.info(f"Starting to scrape: {url}")  # Debug log
+        logger.info(f"Starting to scrape: {url}")
         driver = create_chrome_driver()
         
-        logger.info("Chrome driver created successfully")  # Debug log
+        logger.info("Chrome driver created successfully")
         driver.get(url)
         
-        logger.info("Page loaded successfully")  # Debug log
+        logger.info("Page loaded successfully")
         page_source = driver.page_source
         
         # Parse with BeautifulSoup
         soup = BeautifulSoup(page_source, 'html.parser')
         
-        # Remove script and style elements
+        # Get human-readable DOM content
+        dom_content = get_readable_dom(soup)
+        
+        # Get raw text content
         for script in soup(["script", "style"]):
             script.decompose()
         
@@ -73,22 +154,25 @@ def scrape_website(url: str) -> str:
         chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
         text = ' '.join(chunk for chunk in chunks if chunk)
         
-        logger.info(f"Successfully scraped {len(text)} characters")  # Debug log
+        logger.info(f"Successfully scraped {len(text)} characters")
         
         driver.quit()
-        return text
+        return {
+            "dom_content": dom_content,
+            "raw_content": text
+        }
         
     except Exception as e:
-        logger.error(f"Scraping error details: {str(e)}")  # Debug log
+        logger.error(f"Scraping error details: {str(e)}")
         import traceback
-        logger.error(f"Full traceback: {traceback.format_exc()}")  # Debug log
+        logger.error(f"Full traceback: {traceback.format_exc()}")
         raise
     finally:
         try:
             if 'driver' in locals():
                 driver.quit()
         except Exception as e:
-            logger.error(f"Error closing driver: {str(e)}")  # Debug log
+            logger.error(f"Error closing driver: {str(e)}")
 
 def extract_body_content(html_content):
     if not html_content:
