@@ -69,6 +69,32 @@ def format_response_with_table(text):
         "text": text
     }
 
+def clean_verified_response(response: str) -> str:
+    """Clean up verification metadata from the response."""
+    # List of verification-related phrases to remove
+    cleanup_patterns = [
+        r"The response provided accurately answers.*?\n",
+        r"All stated facts match.*?\n",
+        r"The response is accurate.*?\n",
+        r"Since the response is accurate.*?\n",
+        r"I will return the original response:.*?\n",
+        r"This response is accurate.*?\n",
+        r"The information provided.*?\n",
+        r"After verifying.*?\n",
+        r"Upon verification.*?\n",
+        r"The response correctly.*?\n"
+    ]
+    
+    cleaned = response
+    for pattern in cleanup_patterns:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE | re.MULTILINE)
+    
+    # Remove extra newlines
+    cleaned = re.sub(r'\n\s*\n\s*\n', '\n\n', cleaned)
+    cleaned = cleaned.strip()
+    
+    return cleaned
+
 def verify_response(content: str, response: str, user_query: str, llm_config: dict) -> str:
     """Verify the response by asking LLM to check its accuracy against the content."""
     verification_prompt = f"""You are a fact-checker. Verify if the following response accurately answers the user's question based on the provided content.
@@ -85,11 +111,13 @@ def verify_response(content: str, response: str, user_query: str, llm_config: di
     3. Ensure the response directly answers the user's question
     4. If you find any inaccuracies, provide the correct information from the content
     5. If the response is accurate but incomplete, add missing relevant information
+    6. DO NOT include any verification metadata in your response
+    7. Just provide the final, corrected answer
     
     Return format:
-    - If response is accurate: Return the original response
-    - If response needs correction: Return the corrected response
-    - If response is completely wrong: Return a new accurate response based on the content"""
+    - If accurate: Return ONLY the verified information without any verification statements
+    - If needs correction: Return ONLY the corrected information without any verification statements
+    - If wrong: Return ONLY the accurate information without any verification statements"""
     
     try:
         verification = ollama.chat(
@@ -100,11 +128,14 @@ def verify_response(content: str, response: str, user_query: str, llm_config: di
         
         verified_response = verification['message']['content']
         
-        # If the verification indicates the response was accurate, return original
-        if "accurate" in verified_response.lower() and len(verified_response) < len(response):
+        # Clean up the response
+        cleaned_response = clean_verified_response(verified_response)
+        
+        # If the cleaned response is too short, use the original
+        if len(cleaned_response.strip()) < 10:
             return response
             
-        return verified_response
+        return cleaned_response
         
     except Exception as e:
         print(f"Error in verification: {str(e)}")
