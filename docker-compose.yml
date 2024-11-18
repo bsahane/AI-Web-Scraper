@@ -21,7 +21,6 @@ services:
       - "host.docker.internal:host-gateway"
     depends_on:
       - selenium-chrome
-      - ollama
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501"]
       interval: 10s
@@ -49,14 +48,6 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  ollama:
-    image: ollama/ollama:latest
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama:/root/.ollama
-    platform: linux/amd64
-    restart: unless-stopped
-
-volumes:
-  ollama:
+networks:
+  default:
+    driver: bridge

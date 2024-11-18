@@ -9,23 +9,80 @@ import json
 import time
 import ollama
 import re
-from typing import List
+from typing import List, Dict, Any, Optional
 import pandas as pd
+from urllib.parse import urljoin
 
-# Set Ollama host from environment or use localhost as default
+# Set Ollama host from environment or use default
 OLLAMA_HOST = os.getenv('OLLAMA_HOST', 'http://localhost:11434')
+if not OLLAMA_HOST.startswith('http://'):
+    OLLAMA_HOST = f'http://{OLLAMA_HOST}'
 print(f"Initializing with Ollama host: {OLLAMA_HOST}")  # Debug log
 
-def get_llm(config):
+def get_llm(config: Dict[str, Any]) -> Ollama:
     """Get LLM instance based on configuration"""
     try:
-        return Ollama(
-            base_url=OLLAMA_HOST,
+        # Ensure the host URL is properly formatted
+        host = config.get('host', OLLAMA_HOST)
+        if not host.startswith('http://'):
+            host = f'http://{host}'
+            
+        # Create the Ollama instance
+        llm = Ollama(
+            base_url=host,
             model=config.get('model', 'llama2')
         )
+        
+        # Test the connection
+        try:
+            llm.predict("test")
+            print("Successfully connected to Ollama")
+        except Exception as e:
+            print(f"Warning: Initial connection test failed: {str(e)}")
+            # Try alternative host if in Docker
+            if 'docker' in host:
+                alternative_host = 'http://ollama:11434'
+                print(f"Trying alternative host: {alternative_host}")
+                llm = Ollama(
+                    base_url=alternative_host,
+                    model=config.get('model', 'llama2')
+                )
+                llm.predict("test")
+                print("Successfully connected to alternative Ollama host")
+        
+        return llm
+        
     except Exception as e:
         print(f"Error initializing LLM: {str(e)}")
         raise
+
+def make_ollama_request(endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Make a request to Ollama API with proper error handling"""
+    try:
+        # Ensure the host URL is properly formatted
+        base_url = OLLAMA_HOST
+        if not base_url.startswith('http://'):
+            base_url = f'http://{base_url}'
+            
+        # Construct the full URL
+        url = urljoin(base_url, endpoint)
+        
+        # Make the request
+        response = requests.post(url, json=data, timeout=30)
+        response.raise_for_status()
+        return response.json()
+        
+    except requests.exceptions.ConnectionError:
+        # Try alternative host if in Docker
+        try:
+            alternative_url = urljoin('http://ollama:11434', endpoint)
+            response = requests.post(alternative_url, json=data, timeout=30)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise Exception(f"Failed to connect to Ollama: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Error in Ollama request: {str(e)}")
 
 def format_response_with_table(text):
     """Convert response to include pandas DataFrame for tables"""
@@ -95,155 +152,199 @@ def clean_verified_response(response: str) -> str:
     
     return cleaned
 
-def verify_response(content: str, response: str, user_query: str, llm_config: dict) -> str:
-    """Verify the response by asking LLM to check its accuracy against the content."""
-    verification_prompt = f"""You are a fact-checker. Verify if the following response accurately answers the user's question based on the provided content.
-    
-    Content: {content}
-    
-    User Question: {user_query}
-    
-    Response to Verify: {response}
-    
-    Instructions:
-    1. Check if the response contains any information not present in the content
-    2. Verify if all stated facts match the content exactly
-    3. Ensure the response directly answers the user's question
-    4. If you find any inaccuracies, provide the correct information from the content
-    5. If the response is accurate but incomplete, add missing relevant information
-    6. DO NOT include any verification metadata in your response
-    7. Just provide the final, corrected answer
-    
-    Return format:
-    - If accurate: Return ONLY the verified information without any verification statements
-    - If needs correction: Return ONLY the corrected information without any verification statements
-    - If wrong: Return ONLY the accurate information without any verification statements"""
-    
+def verify_response(content: str, response: str, user_query: str, llm_config: dict) -> tuple[str, bool]:
+    """
+    Verify the response by checking its accuracy against the source content.
+    Returns a tuple of (verified_response, is_verified).
+    """
     try:
-        verification = ollama.chat(
-            model=llm_config.get('model', 'llama2'),
-            messages=[{"role": "user", "content": verification_prompt}],
-            stream=False
-        )
+        llm = get_llm(llm_config)
         
-        verified_response = verification['message']['content']
+        # Create verification prompt
+        verification_prompt = f"""
+        Task: Verify the accuracy of an AI response against the source content.
         
-        # Clean up the response
-        cleaned_response = clean_verified_response(verified_response)
+        Source Content: {content}
         
-        # If the cleaned response is too short, use the original
-        if len(cleaned_response.strip()) < 10:
-            return response
+        User Question: {user_query}
+        
+        AI Response: {response}
+        
+        Instructions:
+        1. Check if the response is directly supported by the source content
+        2. Identify any statements that cannot be verified from the source
+        3. Remove or correct any unsupported claims
+        4. Ensure the response stays focused on the user's question
+        
+        Provide your response in the following format:
+        VERIFIED: [true/false]
+        CONFIDENCE: [0-100]
+        CORRECTED RESPONSE: [your corrected response]
+        REASONING: [brief explanation of changes made]
+        """
+        
+        # Get verification result
+        verification = llm.predict(verification_prompt)
+        
+        # Parse verification result
+        verified = False
+        confidence = 0
+        corrected_response = response
+        reasoning = ""
+        
+        for line in verification.split('\n'):
+            line = line.strip()
+            if line.startswith('VERIFIED:'):
+                verified = line.split(':', 1)[1].strip().lower() == 'true'
+            elif line.startswith('CONFIDENCE:'):
+                try:
+                    confidence = int(line.split(':', 1)[1].strip())
+                except ValueError:
+                    confidence = 0
+            elif line.startswith('CORRECTED RESPONSE:'):
+                corrected_response = line.split(':', 1)[1].strip()
+            elif line.startswith('REASONING:'):
+                reasoning = line.split(':', 1)[1].strip()
+        
+        # If verification failed or confidence is low, perform a second verification
+        if not verified or confidence < 70:
+            second_prompt = f"""
+            The previous response may not be accurate. Please provide a new response that:
+            1. Only uses information directly found in the source content
+            2. Clearly indicates if any requested information is not available
+            3. Uses direct quotes or references from the source when possible
             
-        return cleaned_response
+            Source Content: {content}
+            User Question: {user_query}
+            
+            Provide a new, verified response:
+            """
+            
+            corrected_response = llm.predict(second_prompt)
+            verified = True  # Second response should be verified
+            
+        # Add verification metadata
+        final_response = corrected_response
+        if reasoning:
+            final_response += f"\n\n[Verification: {'✓' if verified else '✗'} | Confidence: {confidence}%]"
+        
+        return final_response, verified
         
     except Exception as e:
-        print(f"Error in verification: {str(e)}")
-        return response  # Return original response if verification fails
+        print(f"Error in verify_response: {str(e)}")
+        return response, False
 
 def chat_about_content(content: str, user_query: str, llm_config: dict, images=None) -> dict:
-    """Chat about the website content"""
+    """Chat about the website content with improved verification"""
     try:
-        # Check if query is about images
-        image_keywords = ['image', 'picture', 'photo', 'show', 'display', 'icon', 'logo']
-        is_image_query = any(keyword in user_query.lower() for keyword in image_keywords)
+        # Initial prompt engineering
+        chat_prompt = f"""
+        Based on the following webpage content, answer this question: {user_query}
         
-        # Check if query is about schedules
-        schedule_keywords = ['schedule', 'timing', 'time', 'aarti', 'puja', 'darshan']
-        is_schedule_query = any(keyword in user_query.lower() for keyword in schedule_keywords)
-        
-        system_prompt = """You are a helpful assistant analyzing a website's content. 
-        Follow these guidelines:
-        1. Provide clear, concise answers based ONLY on the content provided
-        2. If the information isn't available in the content, say so honestly
-        3. When presenting information with images:
-           - Describe what each relevant image shows
-           - Include image descriptions and alt text when available
-           - Reference images by their descriptions
-        4. When presenting schedules, timings, or lists:
-           - Present each item on a new line
+        Instructions:
+        1. Only use information directly found in the content
+        2. If the information isn't available, clearly state that
+        3. For schedules or timings:
+           - List each timing on a new line
+           - Use format: "Time - Event - Description"
            - Include all available details
-           - Maintain the original formatting and order
-        5. Always provide a meaningful response, even if the exact information isn't found
-        6. Be precise and accurate - only include information that is explicitly stated in the content"""
+        4. Be specific and detailed in your response
+        5. If no relevant information is found, clearly state that
         
-        if is_image_query and images:
-            system_prompt += """
-            For image-related queries:
-            - Focus on describing relevant images
-            - Include image descriptions and context
-            - Mention if images show the requested content
-            - Format each image reference clearly"""
-        
-        if is_schedule_query:
-            system_prompt += """
-            For schedule-related queries:
-            - Extract ALL schedule information
-            - Format in a clear, structured way
-            - Include times, events, and descriptions
-            - Separate different schedule types clearly"""
-        
-        # Create content text with images if available
-        content_text = f"Website content:\n{content}\n"
-        if images:
-            content_text += "\nAvailable images:\n"
-            for img in images:
-                content_text += f"- {img.get('description', 'No description')} (Alt: {img.get('alt_text', 'No alt text')})\n"
-        content_text += f"\nUser question: {user_query}"
-        
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": content_text}
-        ]
+        Webpage Content:
+        {content}
+        """
         
         # Get initial response
-        response = ollama.chat(
-            model=llm_config.get('model', 'llama2'),
-            messages=messages,
-            stream=False
-        )
+        llm = get_llm(llm_config)
+        initial_response = llm.predict(chat_prompt)
         
-        response_text = response['message']['content']
-        
-        # Verify the response
-        verified_response = verify_response(content, response_text, user_query, llm_config)
-        
-        # Process schedule information if present
-        if is_schedule_query:
-            schedule_response = process_schedule_response(verified_response)
-            if schedule_response["has_table"]:
-                return schedule_response
-        
-        # Process image information if present
-        if is_image_query and images:
-            relevant_images = []
-            for img in images:
-                img_text = f"{img.get('description', '')} {img.get('alt_text', '')} {img.get('title', '')}".lower()
-                query_terms = user_query.lower().split()
-                
-                if any(term in img_text for term in query_terms):
-                    relevant_images.append(img)
+        # For schedule queries, use a specialized prompt
+        if any(word in user_query.lower() for word in ['schedule', 'time', 'when', 'hours', 'timing', 'aarti']):
+            schedule_prompt = f"""
+            Extract schedule information from this content. Format it as:
+            Time - Event - Description
             
-            if relevant_images:
+            Example format:
+            6:00 AM - Morning Aarti - Main Temple
+            12:00 PM - Afternoon Aarti - With special offerings
+            
+            Content: {content}
+            Query: {user_query}
+            
+            List all relevant timings and events:
+            """
+            
+            schedule_response = llm.predict(schedule_prompt)
+            schedule_info = process_schedule_response(schedule_response)
+            
+            if schedule_info.get('has_table', False):
+                # Format table data for display
+                table = schedule_info['table']
+                formatted_response = "Schedule Information:\n\n"
+                for _, row in table.iterrows():
+                    time = row['Time'].strip()
+                    event = row['Event'].strip()
+                    desc = row['Description'].strip()
+                    if time and event:
+                        formatted_response += f"{time} - {event}"
+                        if desc:
+                            formatted_response += f" - {desc}"
+                        formatted_response += "\n"
+                
                 return {
-                    "has_images": True,
-                    "images": relevant_images,
-                    "text": verified_response
+                    "text": formatted_response,
+                    "verified": True,
+                    "has_table": True,
+                    "table": table
                 }
         
-        # Return normal response
-        return {
-            "has_images": False,
-            "text": verified_response
+        # Verify and potentially correct the response
+        verified_response, is_verified = verify_response(content, initial_response, user_query, llm_config)
+        
+        # Handle image-related queries
+        has_images = False
+        image_list = []
+        if images and any(word in user_query.lower() for word in ['image', 'picture', 'photo', 'show', 'display']):
+            # Create image prompt
+            image_prompt = f"""
+            Based on the user's question: {user_query}
+            And the available images, which images are relevant?
+            
+            Available Images:
+            {json.dumps([{'index': i, 'description': img.get('description', 'No description')} 
+                        for i, img in enumerate(images)])}
+            
+            Return a JSON array of relevant image indices.
+            """
+            
+            try:
+                image_response = llm.predict(image_prompt)
+                relevant_indices = json.loads(image_response)
+                if isinstance(relevant_indices, list):
+                    has_images = True
+                    image_list = [images[i] for i in relevant_indices if i < len(images)]
+            except (json.JSONDecodeError, IndexError) as e:
+                print(f"Error processing images: {str(e)}")
+        
+        # Construct the final response
+        response = {
+            "text": verified_response,
+            "verified": is_verified,
+            "has_images": has_images,
+            "images": image_list if has_images else None
         }
         
+        return response
+        
     except Exception as e:
-        import traceback
-        print(f"Error in chat_about_content: {str(e)}")
-        print(traceback.format_exc())
+        error_msg = f"Error in chat_about_content: {str(e)}"
+        print(error_msg)
         return {
+            "text": f"I apologize, but I encountered an error while processing your request. Please try rephrasing your question. Error: {str(e)}",
+            "verified": False,
             "has_images": False,
-            "text": f"I encountered an error while processing your request: {str(e)}"
+            "images": None
         }
 
 def process_schedule_response(response_text):
@@ -261,31 +362,55 @@ def process_schedule_response(response_text):
             
             # Check if this is a section header
             if any(line.lower().startswith(header) for header in ['daily', 'weekly', 'monthly', 'yearly', 'schedule:', 'timing:', 'aarti:']):
-                if current_section != line:
-                    current_section = line
-                    has_schedule = True
-                    table_data.append(["", f"**{line}**", ""])
+                current_section = line
+                has_schedule = True
                 continue
             
             # Try to parse schedule entries
-            parts = [p.strip() for p in re.split(r'\||[-–]', line) if p.strip()]
+            # First, try splitting by common delimiters
+            parts = []
+            for delimiter in [' - ', ' – ', '|', ':']:
+                if delimiter in line:
+                    parts = [p.strip() for p in line.split(delimiter) if p.strip()]
+                    if len(parts) >= 2:
+                        break
+            
+            # If no delimiter found, try to parse time pattern
+            if not parts:
+                time_pattern = r'(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))'
+                time_match = re.search(time_pattern, line)
+                if time_match:
+                    time = time_match.group(1)
+                    rest = line.replace(time, '').strip()
+                    parts = [time, rest]
             
             if len(parts) >= 2:
-                if len(parts) >= 3:
-                    time, event, description = parts[0], parts[1], ' - '.join(parts[2:])
-                else:
-                    time, event = parts[0], parts[1]
-                    description = ""
+                # Process the parts
+                time = parts[0]
+                event = parts[1]
+                description = ' '.join(parts[2:]) if len(parts) > 2 else ""
                 
+                # Clean up the time format
                 time = re.sub(r'\s+', ' ', time)
+                if ':' not in time and any(x in time.upper() for x in ['AM', 'PM']):
+                    time = time.replace('AM', ' AM').replace('PM', ' PM')
+                
                 table_data.append([time, event, description])
                 has_schedule = True
             elif line and current_section and not line.endswith(':'):
+                # Handle lines without clear time-event separation
                 table_data.append(["", line, ""])
                 has_schedule = True
         
         if has_schedule and table_data:
             df = pd.DataFrame(table_data, columns=['Time', 'Event', 'Description'])
+            # Sort by time if possible
+            try:
+                df['_time_sort'] = pd.to_datetime(df['Time'], format='%I:%M %p', errors='coerce')
+                df = df.sort_values('_time_sort').drop('_time_sort', axis=1)
+            except:
+                pass  # Skip sorting if times can't be parsed
+            
             return {
                 "has_table": True,
                 "table": df,
