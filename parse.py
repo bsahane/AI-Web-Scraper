@@ -12,6 +12,14 @@ import re
 from typing import List, Dict, Any, Optional
 import pandas as pd
 from urllib.parse import urljoin
+import dns.resolver
+import whois
+import socket
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse
+import ssl
+import OpenSSL.crypto as crypto
+from datetime import datetime
 
 # Set Ollama host from environment or use default
 OLLAMA_HOST = os.getenv('OLLAMA_HOST', 'http://localhost:11434')
@@ -234,115 +242,320 @@ def verify_response(content: str, response: str, user_query: str, llm_config: di
         print(f"Error in verify_response: {str(e)}")
         return response, False
 
-def chat_about_content(content: str, user_query: str, llm_config: dict, images=None) -> dict:
-    """Chat about the website content with improved verification"""
+def format_list_response(response_text, query_type):
+    """Format list-type responses with proper structure."""
     try:
-        # Initial prompt engineering
-        chat_prompt = f"""
-        Based on the following webpage content, answer this question: {user_query}
+        lines = response_text.split('\n')
+        formatted_lines = []
+        current_section = None
         
-        Instructions:
-        1. Only use information directly found in the content
-        2. If the information isn't available, clearly state that
-        3. For schedules or timings:
-           - List each timing on a new line
-           - Use format: "Time - Event - Description"
-           - Include all available details
-        4. Be specific and detailed in your response
-        5. If no relevant information is found, clearly state that
+        # Define patterns for different types of information
+        email_pattern = r'[\w\.-]+@[\w\.-]+\.\w+'
+        phone_pattern = r'(?:\+\d{1,3}[-.\s]?)?\d{3,4}[-.\s]?\d{3,4}[-.\s]?\d{3,4}'
         
-        Webpage Content:
-        {content}
-        """
+        # Remove common verification phrases
+        cleanup_patterns = [
+            r'\[Verification:.*?\]',
+            r'\[Confidence:.*?\]',
+            r'Based on .*?, ',
+            r'I found .*?:',
+            r'Here are .*?:',
+            r'Please note.*?\.',
+        ]
         
-        # Get initial response
+        for pattern in cleanup_patterns:
+            response_text = re.sub(pattern, '', response_text, flags=re.IGNORECASE | re.MULTILINE)
+        
+        # Process each line
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Skip common filler phrases
+            if any(phrase in line.lower() for phrase in ['i can', 'please note', 'based on', 'here are']):
+                continue
+            
+            # Process based on query type
+            if query_type == 'email':
+                emails = re.findall(email_pattern, line)
+                for email in emails:
+                    if email not in formatted_lines:
+                        formatted_lines.append(f"• {email}")
+            
+            elif query_type == 'phone':
+                phones = re.findall(phone_pattern, line)
+                for phone in phones:
+                    if phone not in formatted_lines:
+                        formatted_lines.append(f"• {phone}")
+            
+            elif query_type == 'list':
+                # Remove bullet points and numbers at the start
+                line = re.sub(r'^[\d\-\•\*\→\.\s]+', '', line)
+                if line and line not in formatted_lines:
+                    formatted_lines.append(f"• {line}")
+        
+        # Format the final response
+        if query_type in ['email', 'phone']:
+            header = "Contact Information:\n"
+        else:
+            header = ""
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_lines = []
+        for line in formatted_lines:
+            if line not in seen:
+                seen.add(line)
+                unique_lines.append(line)
+        
+        return header + "\n".join(unique_lines)
+    
+    except Exception as e:
+        print(f"Error formatting list response: {str(e)}")
+        return response_text
+
+def verify_and_clean_response(response_text: str, query_type: str, llm_config: dict) -> str:
+    """Verify and clean the response format using LLM."""
+    try:
         llm = get_llm(llm_config)
-        initial_response = llm.predict(chat_prompt)
         
-        # For schedule queries, use a specialized prompt
-        if any(word in user_query.lower() for word in ['schedule', 'time', 'when', 'hours', 'timing', 'aarti']):
-            schedule_prompt = f"""
-            Extract schedule information from this content. Format it as:
-            Time - Event - Description
+        # Create verification prompt based on query type
+        if query_type == 'schedule':
+            verify_prompt = f"""
+            Clean and verify this schedule information. Follow these rules strictly:
+            1. Each entry should be on a new line
+            2. Use format: "Time - Event - Location"
+            3. Remove any duplicates
+            4. Sort chronologically
+            5. Remove any explanatory text or notes
+            6. Ensure consistent time format (HH:MM AM/PM)
+            7. Remove any incomplete or malformed entries
             
-            Example format:
-            6:00 AM - Morning Aarti - Main Temple
-            12:00 PM - Afternoon Aarti - With special offerings
+            Input:
+            {response_text}
             
-            Content: {content}
-            Query: {user_query}
-            
-            List all relevant timings and events:
+            Provide only the cleaned schedule entries, nothing else:
             """
-            
-            schedule_response = llm.predict(schedule_prompt)
-            schedule_info = process_schedule_response(schedule_response)
-            
-            if schedule_info.get('has_table', False):
-                # Format table data for display
-                table = schedule_info['table']
-                formatted_response = "Schedule Information:\n\n"
-                for _, row in table.iterrows():
-                    time = row['Time'].strip()
-                    event = row['Event'].strip()
-                    desc = row['Description'].strip()
-                    if time and event:
-                        formatted_response += f"{time} - {event}"
-                        if desc:
-                            formatted_response += f" - {desc}"
-                        formatted_response += "\n"
-                
-                return {
-                    "text": formatted_response,
-                    "verified": True,
-                    "has_table": True,
-                    "table": table
-                }
         
-        # Verify and potentially correct the response
-        verified_response, is_verified = verify_response(content, initial_response, user_query, llm_config)
-        
-        # Handle image-related queries
-        has_images = False
-        image_list = []
-        if images and any(word in user_query.lower() for word in ['image', 'picture', 'photo', 'show', 'display']):
-            # Create image prompt
-            image_prompt = f"""
-            Based on the user's question: {user_query}
-            And the available images, which images are relevant?
+        elif query_type == 'address':
+            verify_prompt = f"""
+            Clean and verify this address information. Follow these rules strictly:
+            1. Each address should be on a new line
+            2. Start each line with "•"
+            3. Remove any duplicates
+            4. Keep only complete addresses
+            5. Remove any explanatory text
+            6. Format consistently
             
-            Available Images:
-            {json.dumps([{'index': i, 'description': img.get('description', 'No description')} 
-                        for i, img in enumerate(images)])}
+            Input:
+            {response_text}
             
-            Return a JSON array of relevant image indices.
+            Provide only the cleaned address entries, nothing else:
             """
-            
-            try:
-                image_response = llm.predict(image_prompt)
-                relevant_indices = json.loads(image_response)
-                if isinstance(relevant_indices, list):
-                    has_images = True
-                    image_list = [images[i] for i in relevant_indices if i < len(images)]
-            except (json.JSONDecodeError, IndexError) as e:
-                print(f"Error processing images: {str(e)}")
         
-        # Construct the final response
-        response = {
-            "text": verified_response,
-            "verified": is_verified,
-            "has_images": has_images,
-            "images": image_list if has_images else None
+        elif query_type in ['email', 'phone']:
+            verify_prompt = f"""
+            Clean and verify this contact information. Follow these rules strictly:
+            1. Each entry should be on a new line
+            2. Start each line with "•"
+            3. Remove any duplicates
+            4. Keep only valid {query_type}s
+            5. Remove any explanatory text
+            6. Format consistently
+            
+            Input:
+            {response_text}
+            
+            Provide only the cleaned {query_type} entries, nothing else:
+            """
+        
+        else:  # general list
+            verify_prompt = f"""
+            Clean and verify this list. Follow these rules strictly:
+            1. Each item should be on a new line
+            2. Start each line with "•"
+            3. Remove any duplicates
+            4. Remove any explanatory text
+            5. Keep only complete and relevant items
+            6. Format consistently
+            
+            Input:
+            {response_text}
+            
+            Provide only the cleaned list entries, nothing else:
+            """
+        
+        # Get verified response
+        verified = llm.predict(verify_prompt)
+        
+        # Add appropriate header
+        headers = {
+            'schedule': 'Schedule Information:',
+            'address': 'Address Information:',
+            'email': 'Email Addresses:',
+            'phone': 'Contact Numbers:',
+            'list': ''
         }
         
-        return response
+        header = headers.get(query_type, '')
+        if header:
+            verified = f"{header}\n\n{verified.strip()}"
+        
+        return verified.strip()
+    
+    except Exception as e:
+        print(f"Error in verify_and_clean_response: {str(e)}")
+        return response_text
+
+def understand_query(query: str, llm_config: dict) -> dict:
+    """Understand the user's query and determine the expected response format."""
+    try:
+        llm = get_llm(llm_config)
+        understanding_prompt = f"""
+        Analyze this user query and determine the following:
+        Query: "{query}"
+        
+        1. What type of information is being requested?
+        2. What specific details should be extracted?
+        3. What's the best format to present this information?
+        
+        Return your analysis in JSON format:
+        {{
+            "query_type": "schedule|address|contact|list|general",
+            "expected_details": ["detail1", "detail2"],
+            "format_type": "table|bullets|paragraph",
+            "special_requirements": ["requirement1", "requirement2"]
+        }}
+        """
+        
+        response = llm.predict(understanding_prompt)
+        return json.loads(response)
+    except Exception as e:
+        print(f"Error in understand_query: {str(e)}")
+        return {
+            "query_type": "general",
+            "expected_details": [],
+            "format_type": "paragraph",
+            "special_requirements": []
+        }
+
+def extract_information(content: str, query_understanding: dict, llm_config: dict) -> str:
+    """Extract relevant information based on query understanding."""
+    try:
+        llm = get_llm(llm_config)
+        
+        # Create extraction prompt based on query understanding
+        extraction_prompt = f"""
+        Extract information from this content based on the following requirements:
+        
+        Query Type: {query_understanding['query_type']}
+        Expected Details: {', '.join(query_understanding['expected_details'])}
+        Format Type: {query_understanding['format_type']}
+        Special Requirements: {', '.join(query_understanding['special_requirements'])}
+        
+        Content:
+        {content}
+        
+        Rules:
+        1. Only extract information that exists in the content
+        2. Be precise and accurate
+        3. Format according to the specified format type
+        4. Follow any special requirements
+        5. Remove any duplicate information
+        """
+        
+        return llm.predict(extraction_prompt)
+    except Exception as e:
+        print(f"Error in extract_information: {str(e)}")
+        return ""
+
+def verify_and_format_response(extracted_info: str, query_understanding: dict, llm_config: dict) -> str:
+    """Verify the extracted information and format it appropriately."""
+    try:
+        llm = get_llm(llm_config)
+        
+        verification_prompt = f"""
+        Verify and format this information:
+        
+        Information:
+        {extracted_info}
+        
+        Requirements:
+        1. Query Type: {query_understanding['query_type']}
+        2. Format: {query_understanding['format_type']}
+        3. Expected Details: {', '.join(query_understanding['expected_details'])}
+        
+        Verification and Formatting Rules:
+        1. Focus ONLY on the specifically requested information
+        2. Remove ALL unnecessary context and explanations
+        3. Use clear visual hierarchy with proper spacing
+        4. For schedules:
+           - Use format: "HH:MM AM - Event" (24-hour format not allowed)
+           - Sort chronologically
+           - Group similar events
+           - Add duration if available
+           - Use bold for timing
+        5. Use markdown formatting:
+           - ## for main headers
+           - Bold for important information
+           - Lists with proper indentation
+        6. Keep responses concise and well-organized
+        7. Remove any duplicate information
+        8. Use table format when it improves readability
+        
+        Return ONLY the verified and formatted information, nothing else:
+        """
+        
+        return llm.predict(verification_prompt)
+    except Exception as e:
+        print(f"Error in verify_and_format_response: {str(e)}")
+        return extracted_info
+
+def chat_about_content(content: str, user_query: str, llm_config: dict, images=None, url=None) -> dict:
+    """Enhanced chat functionality with website metadata support."""
+    try:
+        # Get website metadata if URL is provided
+        metadata_info = ""
+        if url:
+            metadata = get_website_metadata(url)
+            metadata_info = format_metadata_response(metadata)
+        
+        # Get query understanding and process response as before
+        query_understanding = understand_query(user_query, llm_config)
+        extracted_info = extract_information(content, query_understanding, llm_config)
+        final_response = verify_and_format_response(extracted_info, query_understanding, llm_config)
+        
+        # Combine metadata with final response if metadata exists
+        if metadata_info:
+            final_response = f"{metadata_info}\n{'=' * 50}\n\n{final_response}"
+        
+        # Handle special formatting cases
+        if query_understanding['query_type'] == 'schedule':
+            schedule_info = process_schedule_response(final_response)
+            if schedule_info.get('has_table', False):
+                return {
+                    "text": schedule_info['text'],
+                    "verified": True,
+                    "has_table": True,
+                    "table": schedule_info['table']
+                }
+        
+        return {
+            "text": final_response,
+            "verified": True,
+            "has_table": False,
+            "has_images": False,
+            "images": None
+        }
         
     except Exception as e:
         error_msg = f"Error in chat_about_content: {str(e)}"
         print(error_msg)
         return {
-            "text": f"I apologize, but I encountered an error while processing your request. Please try rephrasing your question. Error: {str(e)}",
+            "text": "I apologize, but I encountered an error while processing your request. Please try rephrasing your question.",
             "verified": False,
+            "has_table": False,
             "has_images": False,
             "images": None
         }
@@ -360,16 +573,21 @@ def process_schedule_response(response_text):
             if not line:
                 continue
             
+            # Skip common non-schedule lines
+            if any(line.lower().startswith(word) for word in ['the', 'this', 'please', 'here', 'note:']):
+                continue
+                
             # Check if this is a section header
-            if any(line.lower().startswith(header) for header in ['daily', 'weekly', 'monthly', 'yearly', 'schedule:', 'timing:', 'aarti:']):
+            if line.endswith(':'):
                 current_section = line
                 has_schedule = True
                 continue
             
-            # Try to parse schedule entries
-            # First, try splitting by common delimiters
+            # Try to parse schedule entries with various formats
             parts = []
-            for delimiter in [' - ', ' – ', '|', ':']:
+            
+            # Try different delimiters
+            for delimiter in [' - ', ' – ', '|', ':', '→', '⇒']:
                 if delimiter in line:
                     parts = [p.strip() for p in line.split(delimiter) if p.strip()]
                     if len(parts) >= 2:
@@ -377,12 +595,21 @@ def process_schedule_response(response_text):
             
             # If no delimiter found, try to parse time pattern
             if not parts:
-                time_pattern = r'(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))'
-                time_match = re.search(time_pattern, line)
-                if time_match:
-                    time = time_match.group(1)
-                    rest = line.replace(time, '').strip()
-                    parts = [time, rest]
+                # Enhanced time pattern to catch more formats
+                time_patterns = [
+                    r'(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))',  # 9:00 AM or 9 AM
+                    r'(\d{1,2}[:.]\d{2}(?:\s*hrs?)?)',  # 09:00 or 09.00 hrs
+                    r'(\d{1,2}\s*o\'clock)',  # 9 o'clock
+                    r'(\d{4}\s*hrs)',  # 0900 hrs
+                ]
+                
+                for pattern in time_patterns:
+                    time_match = re.search(pattern, line)
+                    if time_match:
+                        time = time_match.group(1)
+                        rest = line.replace(time, '', 1).strip(' -:→⇒')
+                        parts = [time, rest]
+                        break
             
             if len(parts) >= 2:
                 # Process the parts
@@ -390,10 +617,37 @@ def process_schedule_response(response_text):
                 event = parts[1]
                 description = ' '.join(parts[2:]) if len(parts) > 2 else ""
                 
-                # Clean up the time format
+                # Clean and standardize time format
                 time = re.sub(r'\s+', ' ', time)
+                
+                # Convert 24-hour format to 12-hour format
+                if 'hrs' in time.lower():
+                    try:
+                        time = time.lower().replace('hrs', '').strip()
+                        if '.' in time:
+                            time = time.replace('.', ':')
+                        if ':' not in time:
+                            time = f"{time[:2]}:{time[2:]}"
+                        time_obj = datetime.strptime(time, '%H:%M')
+                        time = time_obj.strftime('%I:%M %p').lstrip('0')
+                    except:
+                        pass
+                
+                # Add missing :00 for times like "9 AM"
                 if ':' not in time and any(x in time.upper() for x in ['AM', 'PM']):
-                    time = time.replace('AM', ' AM').replace('PM', ' PM')
+                    try:
+                        time_parts = time.upper().split()
+                        time = f"{time_parts[0]}:00 {time_parts[1]}"
+                    except:
+                        pass
+                
+                # Clean up AM/PM format
+                time = time.upper().replace('AM', ' AM').replace('PM', ' PM')
+                time = re.sub(r'\s+', ' ', time).strip()
+                
+                # Clean up event and description
+                event = event.strip(' -:→⇒')
+                description = description.strip(' -:→⇒')
                 
                 table_data.append([time, event, description])
                 has_schedule = True
@@ -404,17 +658,38 @@ def process_schedule_response(response_text):
         
         if has_schedule and table_data:
             df = pd.DataFrame(table_data, columns=['Time', 'Event', 'Description'])
+            
             # Sort by time if possible
             try:
                 df['_time_sort'] = pd.to_datetime(df['Time'], format='%I:%M %p', errors='coerce')
                 df = df.sort_values('_time_sort').drop('_time_sort', axis=1)
+                df = df.reset_index(drop=True)
             except:
                 pass  # Skip sorting if times can't be parsed
+            
+            # Generate a clean text representation
+            text_response = "Schedule Information:\n\n"
+            for _, row in df.iterrows():
+                time = row['Time'].strip()
+                event = row['Event'].strip()
+                desc = row['Description'].strip()
+                
+                if time:
+                    text_response += time
+                    if event:
+                        text_response += f" - {event}"
+                        if desc:
+                            text_response += f" - {desc}"
+                else:
+                    text_response += event
+                    if desc:
+                        text_response += f" - {desc}"
+                text_response += "\n"
             
             return {
                 "has_table": True,
                 "table": df,
-                "text": response_text
+                "text": text_response
             }
         
         return {
@@ -584,3 +859,209 @@ def parse_with_ollama(dom_chunks, parse_description, config):
     
     except Exception as e:
         return f"Error parsing content: {str(e)}"
+
+def get_website_metadata(url: str) -> dict:
+    """Collect comprehensive website metadata."""
+    try:
+        metadata = {
+            "performance": {},
+            "security": {},
+            "dns": {},
+            "headers": {},
+            "seo": {}
+        }
+        
+        # Basic request data with proper headers
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        start_time = datetime.now()
+        response = requests.get(url, headers=headers, timeout=10, verify=False)
+        end_time = datetime.now()
+        
+        # Performance metrics
+        metadata["performance"] = {
+            "response_time": (end_time - start_time).total_seconds(),
+            "page_size": len(response.content) / 1024,  # KB
+            "status_code": response.status_code
+        }
+        
+        # Parse domain
+        parsed_url = urlparse(url)
+        domain = parsed_url.netloc
+        if not domain:
+            domain = parsed_url.path
+        
+        # DNS information
+        try:
+            dns_resolver = dns.resolver.Resolver()
+            dns_resolver.timeout = 5
+            dns_resolver.lifetime = 5
+            
+            metadata["dns"] = {
+                "ip_address": socket.gethostbyname(domain),
+                "mx_records": [],
+                "ns_records": []
+            }
+            
+            # Get MX records
+            try:
+                mx_records = dns_resolver.resolve(domain, 'MX')
+                metadata["dns"]["mx_records"] = [str(mx.exchange) for mx in mx_records]
+            except Exception as e:
+                print(f"Error getting MX records: {str(e)}")
+            
+            # Get NS records
+            try:
+                ns_records = dns_resolver.resolve(domain, 'NS')
+                metadata["dns"]["ns_records"] = [str(ns) for ns in ns_records]
+            except Exception as e:
+                print(f"Error getting NS records: {str(e)}")
+            
+        except Exception as e:
+            print(f"Error in DNS resolution: {str(e)}")
+            metadata["dns"] = {
+                "error": str(e),
+                "ip_address": "N/A",
+                "mx_records": [],
+                "ns_records": []
+            }
+        
+        # Security information
+        try:
+            if parsed_url.scheme == 'https':
+                context = ssl.create_default_context()
+                with socket.create_connection((domain, 443)) as sock:
+                    with context.wrap_socket(sock, server_hostname=domain) as ssock:
+                        cert = ssock.getpeercert()
+                        metadata["security"] = {
+                            "ssl_issuer": cert.get('issuer', [{'organizationName': 'N/A'}])[0].get('organizationName', 'N/A'),
+                            "ssl_expires": datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z'),
+                            "ssl_version": ssock.version()
+                        }
+            else:
+                metadata["security"] = {
+                    "ssl_issuer": "Not HTTPS",
+                    "ssl_expires": "Not HTTPS",
+                    "ssl_version": "Not HTTPS"
+                }
+        except Exception as e:
+            print(f"Error getting SSL info: {str(e)}")
+            metadata["security"] = {
+                "error": str(e),
+                "ssl_issuer": "Error",
+                "ssl_expires": "Error",
+                "ssl_version": "Error"
+            }
+        
+        # Headers analysis
+        metadata["headers"] = {
+            "server": response.headers.get('Server', 'N/A'),
+            "content_type": response.headers.get('Content-Type', 'N/A'),
+            "cache_control": response.headers.get('Cache-Control', 'N/A')
+        }
+        
+        # Parse HTML content
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # SEO elements
+        title = soup.title.string if soup.title else ''
+        meta_desc = soup.find('meta', {'name': 'description'})
+        meta_desc_content = meta_desc['content'] if meta_desc else ''
+        
+        metadata["seo"] = {
+            "title": title,
+            "meta_description": meta_desc_content,
+            "h1_count": len(soup.find_all('h1')),
+            "h2_count": len(soup.find_all('h2')),
+            "h3_count": len(soup.find_all('h3')),
+            "images_total": len(soup.find_all('img')),
+            "images_without_alt": len([img for img in soup.find_all('img') if not img.get('alt')]),
+            "links_count": len(soup.find_all('a')),
+            "meta_tags_count": len(soup.find_all('meta'))
+        }
+        
+        return metadata
+    except Exception as e:
+        print(f"Error in get_website_metadata: {str(e)}")
+        return {
+            "error": str(e),
+            "performance": {"response_time": 0, "page_size": 0, "status_code": 0},
+            "security": {"ssl_issuer": "Error", "ssl_expires": "Error", "ssl_version": "Error"},
+            "dns": {"ip_address": "Error", "mx_records": [], "ns_records": []},
+            "headers": {"server": "Error", "content_type": "Error", "cache_control": "Error"},
+            "seo": {
+                "title": "",
+                "meta_description": "",
+                "h1_count": 0,
+                "h2_count": 0,
+                "h3_count": 0,
+                "images_total": 0,
+                "images_without_alt": 0,
+                "links_count": 0,
+                "meta_tags_count": 0
+            }
+        }
+
+def format_metadata_response(metadata: dict) -> str:
+    """Format website metadata into a readable response."""
+    try:
+        response = []
+        
+        response.append("## 📊 Website Technical Information\n")
+        
+        # Performance Section
+        response.append("### ⚡ Performance")
+        perf = metadata.get("performance", {})
+        response.append(f"• Response Time: **{perf.get('response_time', 'N/A'):.2f}s**")
+        response.append(f"• Page Size: **{perf.get('page_size', 'N/A'):.1f} KB**")
+        response.append(f"• Status Code: **{perf.get('status_code', 'N/A')}**\n")
+        
+        # Security Section
+        response.append("### 🔒 Security")
+        sec = metadata.get("security", {})
+        if isinstance(sec, dict) and "error" not in sec:
+            response.append(f"• SSL Issuer: **{sec.get('ssl_issuer', {}).get(b'O', b'N/A').decode()}**")
+            response.append(f"• SSL Expires: **{sec.get('ssl_expires', 'N/A')}**")
+            response.append(f"• SSL Version: **{sec.get('ssl_version', 'N/A')}**\n")
+        else:
+            response.append("• SSL Information: Not Available\n")
+        
+        # DNS Section
+        response.append("### 🌐 DNS Information")
+        dns_info = metadata.get("dns", {})
+        if isinstance(dns_info, dict) and "error" not in dns_info:
+            response.append(f"• IP Address: **{dns_info.get('ip_address', 'N/A')}**")
+            response.append("• MX Records:")
+            for mx in dns_info.get('mx_records', [])[:3]:
+                response.append(f"  - {mx}")
+            response.append("• Name Servers:")
+            for ns in dns_info.get('ns_records', [])[:3]:
+                response.append(f"  - {ns}\n")
+        else:
+            response.append("• DNS Information: Not Available\n")
+        
+        # Headers Section
+        response.append("### 📋 Headers")
+        headers = metadata.get("headers", {})
+        response.append(f"• Server: **{headers.get('server', 'N/A')}**")
+        response.append(f"• Content Type: **{headers.get('content_type', 'N/A')}**")
+        response.append(f"• Cache Control: **{headers.get('cache_control', 'N/A')}**\n")
+        
+        # SEO Section
+        response.append("### 🔍 SEO Analysis")
+        seo = metadata.get("seo", {})
+        response.append(f"• Title Length: **{len(seo.get('title', '')) if seo.get('title') != 'N/A' else 'N/A'}**")
+        response.append(f"• Meta Description: **{'Present' if seo.get('meta_description') != 'N/A' else 'Missing'}**")
+        response.append(f"• H1 Tags: **{seo.get('h1_count', 'N/A')}**")
+        response.append(f"• H2 Tags: **{seo.get('h2_count', 'N/A')}**")
+        response.append(f"• H3 Tags: **{seo.get('h3_count', 'N/A')}**")
+        response.append(f"• Images Total: **{seo.get('images_total', 'N/A')}**")
+        response.append(f"• Images without Alt: **{seo.get('images_without_alt', 'N/A')}**")
+        response.append(f"• Links Count: **{seo.get('links_count', 'N/A')}**")
+        response.append(f"• Meta Tags Count: **{seo.get('meta_tags_count', 'N/A')}**\n")
+        
+        return "\n".join(response)
+    except Exception as e:
+        return f"Error formatting metadata: {str(e)}"
